@@ -461,14 +461,21 @@ class ReasoningEngine:
 
                         # Execute all tools in parallel
                         start_parallel = asyncio.get_event_loop().time()
-                        results = await asyncio.gather(*tasks)
+                        results = await asyncio.gather(*tasks, return_exceptions=True)
                         parallel_duration = asyncio.get_event_loop().time() - start_parallel
                         set_span_attribute("parallel_execution_time_ms", int(parallel_duration * 1000))
 
                         # Process results
                         combined_observation = []
-                        for idx, (tool_result, tool_duration) in enumerate(results):
+                        for idx, result_item in enumerate(results):
                             tc = tool_calls[idx]
+                            
+                            if isinstance(result_item, Exception):
+                                logger.error(f"❌ [Parallel Exec Error] Tool {tc.tool_name} failed: {result_item}", exc_info=True)
+                                tool_result = f"Error executing {tc.tool_name}: {str(result_item)}"
+                                tool_duration = 0.0
+                            else:
+                                tool_result, tool_duration = result_item
                             
                             # Store tool timing for metrics
                             tc.execution_time = tool_duration
@@ -977,14 +984,22 @@ Do not invent information. If the context is insufficient, admit it.
                     )
 
                 # 3. Execute in parallel
-                results = await asyncio.gather(*tasks)
+                results = await asyncio.gather(*tasks, return_exceptions=True)
 
                 # 4. Process results and yield observations
                 should_exit = False
                 combined_observation = []
 
-                for idx, (tool_result, tool_duration) in enumerate(results):
+                for idx, result_item in enumerate(results):
                     tc = tool_calls[idx]
+                    
+                    if isinstance(result_item, Exception):
+                        logger.error(f"❌ [Parallel Stream Error] Tool {tc.tool_name} failed: {result_item}", exc_info=True)
+                        tool_result = f"Error executing {tc.tool_name}: {str(result_item)}"
+                        tool_duration = 0.0
+                    else:
+                        tool_result, tool_duration = result_item
+
                     tc.execution_time = tool_duration
 
                     # Handle citation from vector_search
@@ -1315,6 +1330,8 @@ def detect_team_query(query: str) -> tuple[bool, str, str]:
         "tutto lo staff",
         "vostro staff",
         "il vostro personale",
+        "parlami del team",
+        "about the team",
     )
     if any(marker in ql for marker in list_all_markers):
         return True, "list_all", ""
@@ -1332,6 +1349,8 @@ def detect_team_query(query: str) -> tuple[bool, str, str]:
         "chi segue",
         "chi è il",
         "chi è la",
+        "chi sono i",
+        "chi sono le",
         "who handles",
         "who manages",
         "who is the",
@@ -1357,7 +1376,7 @@ def detect_team_query(query: str) -> tuple[bool, str, str]:
     if has_team_context:
         role_map: dict[str, tuple[str, ...]] = {
             "ceo": ("ceo", "chief executive", "amministratore delegato", "a.d.", "ad "),
-            "founder": ("founder", "cofounder", "co-founder", "fondatore", "fondatrice"),
+            "founder": ("founder", "cofounder", "co-founder", "fondatore", "fondatrice", "fondatori"),
             "tax": ("tax", "tasse", "fiscale", "fiscal", "pajak"),
             "visa": ("visa", "visti", "immigrazione", "immigration"),
             "setup": ("setup", "set up", "onboarding"),

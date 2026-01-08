@@ -76,6 +76,9 @@ async def create_keyword(
             keyword.score_override,
             keyword.is_active
         )
+        logger.info(
+            f"Intel Config: Admin {current_user.get('email')} CREATED keyword '{keyword.term}' (Category: {keyword.category})"
+        )
         return dict(row)
 
 @router.put("/keywords/{keyword_id}", response_model=IntelKeywordResponse)
@@ -117,6 +120,9 @@ async def update_keyword(
         values.append(keyword_id)
         
         row = await conn.fetchrow(query, *values)
+        logger.info(
+            f"Intel Config: Admin {current_user.get('email')} UPDATED keyword ID {keyword_id}"
+        )
         return dict(row)
 
 @router.delete("/keywords/{keyword_id}")
@@ -138,7 +144,10 @@ async def delete_keyword(
         # Check if actually updated
         if "0" in result:
              raise HTTPException(status_code=404, detail="Keyword not found")
-             
+        
+        logger.info(
+            f"Intel Config: Admin {current_user.get('email')} DELETED keyword ID {keyword_id}"
+        )
         return {"success": True, "message": "Keyword deactivated"}
 
 # ============================================================================

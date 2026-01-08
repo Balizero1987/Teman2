@@ -27,14 +27,21 @@ class IntelManagementTool(BaseTool):
     description: ClassVar[str] = "Add or update intelligence keywords and scoring rules. Use this when the user wants to track new topics."
     args_schema: ClassVar[Type[BaseModel]] = AddKeywordInput
 
-    async def execute(self, term: str, category: str, level: str = "medium", **kwargs) -> str:
-        try:
-            import asyncpg
-            
-            if not settings.database_url:
-                return "Error: Database URL not configured."
+    @property
+    def parameters_schema(self) -> dict:
+        return self.args_schema.model_json_schema()
 
-            conn = await asyncpg.connect(settings.database_url)
+    async def _get_connection(self):
+        """Helper to get DB connection, mockable for tests"""
+        import asyncpg
+        if not settings.database_url:
+            raise ValueError("Database URL not configured")
+        return await asyncpg.connect(settings.database_url)
+
+    async def execute(self, term: str, category: str, level: str = "medium", **kwargs) -> str:
+        conn = None
+        try:
+            conn = await self._get_connection()
             try:
                 # Check if exists
                 exists = await conn.fetchval(
