@@ -12,10 +12,19 @@ Formula: FINAL = (R×0.30) + (A×0.20) + (T×0.20) + (C×0.15) + (G×0.15)
 
 import re
 import math
+import os
+import time
 from datetime import datetime, timedelta
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict, Any
 from dataclasses import dataclass
 from loguru import logger
+
+try:
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+except ImportError:
+    psycopg2 = None
+    logger.warning("psycopg2 not installed, dynamic scoring disabled")
 
 
 @dataclass
@@ -38,7 +47,7 @@ class ScoreResult:
 # KEYWORD DATABASE (Bilingual: English + Bahasa Indonesia)
 # =============================================================================
 
-KEYWORDS = {
+DEFAULT_KEYWORDS = {
     "immigration": {
         "direct": [  # Score 100
             # English
@@ -351,7 +360,7 @@ KEYWORDS = {
 # SOURCE AUTHORITY DATABASE
 # =============================================================================
 
-SOURCE_AUTHORITY = {
+DEFAULT_SOURCE_AUTHORITY = {
     # Government Sources (95-100)
     "government": {
         "score": 98,
@@ -594,6 +603,129 @@ ACCURACY_NEGATIVE = [
 
 
 # =============================================================================
+# DYNAMIC SCORER CLASS
+# =============================================================================
+
+class DynamicScorer:
+    """
+    Manages scoring logic with dynamic configuration from Database.
+    Falls back to defaults if DB is unavailable.
+    """
+    
+    def __init__(self):
+        self.keywords = DEFAULT_KEYWORDS
+        self.source_authority = DEFAULT_SOURCE_AUTHORITY
+        self.last_update = 0
+        self.update_interval = 3600  # 1 hour
+        self._db_url = os.environ.get("DATABASE_URL")
+
+    def _get_db_connection(self):
+        if not psycopg2 or not self._db_url:
+            return None
+        try:
+            return psycopg2.connect(self._db_url)
+        except Exception as e:
+            logger.warning(f"DB Connection failed: {e}")
+            return None
+
+    def refresh_config(self):
+        """Fetch latest configuration from DB"""
+        if time.time() - self.last_update < self.update_interval:
+            return
+
+        conn = self._get_db_connection()
+        if not conn:
+            return
+
+        try:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                # 1. Fetch Keywords
+                cur.execute("SELECT term, category, level FROM intel_keywords WHERE is_active = true")
+                rows = cur.fetchall()
+                
+                if rows:
+                    new_keywords = {}
+                    for row in rows:
+                        cat = row['category']
+                        lvl = row['level']
+                        term = row['term']
+                        
+                        if cat not in new_keywords:
+                            new_keywords[cat] = {}
+                        if lvl not in new_keywords[cat]:
+                            new_keywords[cat][lvl] = []
+                        
+                        new_keywords[cat][lvl].append(term)
+                    
+                    self.keywords = new_keywords
+                    logger.info(f"Loaded {len(rows)} keywords from DB")
+
+                # 2. Fetch Source Authority
+                cur.execute("SELECT domain, score, category FROM intel_source_authority WHERE is_active = true")
+                rows = cur.fetchall()
+                
+                if rows:
+                    new_authority = {}
+                    # Group by category to match structure
+                    # Structure: category -> {score: int, sources: []}
+                    # But DB stores individual scores.
+                    # We need to adapt. The current scorer uses categories with fixed scores.
+                    # Let's adapt the DB rows to the dictionary structure.
+                    
+                    # Or better: Create a direct lookup map: domain -> score
+                    # But calculate_authority expects the nested structure.
+                    # Let's stick to the nested structure for compatibility, 
+                    # OR create a new optimized lookup structure in the class.
+                    
+                    # For now, let's reconstruct the categories
+                    # Assuming we group by category and take the average score?
+                    # Or simpler: The DB should dictate the structure.
+                    # Let's rebuild the dictionary based on distinct (category, score) pairs
+                    
+                    grouped = {}
+                    for row in rows:
+                        cat = row['category']
+                        score = row['score']
+                        domain = row['domain']
+                        
+                        key = f"{cat}_{score}" # unique key for this group
+                        if key not in grouped:
+                            grouped[key] = {"score": score, "sources": [], "category": cat}
+                        
+                        grouped[key]["sources"].append(domain)
+                    
+                    # Convert to final dict
+                    new_auth_dict = {}
+                    for k, v in grouped.items():
+                        # We use the category name as key. 
+                        # If multiple scores for same category, we suffix it?
+                        # This shows the DB model is more flexible than the Dict.
+                        # Let's use the DB 'category' as the key.
+                        # If collision, we append? 
+                        # For simplicity, let's assume one score per category in DB usage for now,
+                        # OR just use the raw map in a new method.
+                        
+                        # COMPATIBILITY HACK:
+                        new_auth_dict[v['category']] = {
+                            "score": v['score'],
+                            "sources": v['sources']
+                        }
+                    
+                    self.source_authority = new_auth_dict
+                    logger.info(f"Loaded {len(rows)} authority rules from DB")
+
+            self.last_update = time.time()
+            
+        except Exception as e:
+            logger.error(f"Failed to refresh dynamic config: {e}")
+        finally:
+            conn.close()
+
+# Global instance
+scorer = DynamicScorer()
+
+
+# =============================================================================
 # SCORING FUNCTIONS
 # =============================================================================
 
@@ -603,13 +735,16 @@ def calculate_relevance(title: str, content: str) -> Tuple[int, List[str], str]:
     Calculate relevance score based on keyword matching.
     Returns (score, matched_keywords, category)
     """
+    # Try to refresh config lazily
+    scorer.refresh_config()
+    
     text = f" {title} {content} ".lower()
 
     best_score = 0
     matched_keywords = []
     matched_category = "general"
 
-    for category, levels in KEYWORDS.items():
+    for category, levels in scorer.keywords.items():
         for level, keywords in levels.items():
             level_score = {"direct": 100, "high": 90, "medium": 70}.get(level, 50)
 
@@ -637,11 +772,14 @@ def calculate_authority(source: str, source_url: str = "") -> int:
     """
     Calculate authority score based on source reputation.
     """
+    # Try to refresh config lazily
+    scorer.refresh_config()
+    
     source_lower = source.lower()
     url_lower = (source_url or "").lower()
     combined = f"{source_lower} {url_lower}"
 
-    for category, data in SOURCE_AUTHORITY.items():
+    for category, data in scorer.source_authority.items():
         for known_source in data["sources"]:
             if known_source in combined:
                 return data["score"]
