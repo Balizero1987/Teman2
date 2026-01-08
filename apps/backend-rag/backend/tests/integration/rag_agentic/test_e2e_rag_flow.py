@@ -28,6 +28,21 @@ from services.rag.agentic import AgenticRAGOrchestrator
 from services.llm_clients.pricing import TokenUsage
 
 
+@pytest.fixture(autouse=True)
+def mock_trace_span():
+    """Disable tracing for tests to avoid generator issues with mocks"""
+    from contextlib import contextmanager
+    
+    @contextmanager
+    def noop_trace_span(*args, **kwargs):
+        yield MagicMock()
+        
+    with patch("services.rag.agentic.orchestrator.trace_span", side_effect=noop_trace_span), \
+         patch("services.rag.agentic.reasoning.trace_span", side_effect=noop_trace_span), \
+         patch("app.utils.tracing.trace_span", side_effect=noop_trace_span):
+        yield
+
+
 @pytest.fixture
 def mock_search_service():
     """Mock SearchService for RAG retrieval"""
