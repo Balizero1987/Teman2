@@ -1,12 +1,14 @@
 'use client';
 
-import { RefObject } from 'react';
+import { RefObject, useEffect } from 'react';
 import Image from 'next/image';
 import { motion } from 'framer-motion';
 import { Button } from '@/components/ui/button';
 import { MessageBubble } from './MessageBubble';
 import { ThinkingIndicator } from './ThinkingIndicator';
 import { Message } from '@/types';
+import { useNeural } from '@/components/layout/NeuralWrapper';
+
 
 export interface ChatMessageListProps {
   messages: Message[];
@@ -29,6 +31,16 @@ export function ChatMessageList({
   onSetInput,
   onOpenSearchDocs,
 }: ChatMessageListProps) {
+  const { setActivityLevel, pulse } = useNeural();
+
+  useEffect(() => {
+    if (isLoading) {
+      setActivityLevel(0.8); // High activity when loading
+    } else {
+      setActivityLevel(0.1); // Back to idle
+    }
+  }, [isLoading, setActivityLevel]);
+
   if (messages.length === 0) {
     return (
       <div className="flex-1 flex flex-col items-center justify-center p-4 min-h-0 relative z-10">

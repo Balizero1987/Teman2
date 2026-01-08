@@ -2,7 +2,9 @@ import type { Metadata, Viewport } from 'next';
 import { Geist, Geist_Mono } from 'next/font/google';
 import { Toaster } from 'sonner';
 import { OrganizationJsonLd, LocalBusinessJsonLd, WebsiteJsonLd } from '@/components/seo';
+import { NeuralWrapper } from '@/components/layout/NeuralWrapper';
 import './globals.css';
+
 
 const geistSans = Geist({
   variable: '--font-geist-sans',
@@ -145,20 +147,22 @@ export default function RootLayout({
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased bg-[var(--background)] text-[var(--foreground)]`}
       >
-        {children}
-        <Toaster
-          position="bottom-right"
-          theme="dark"
-          richColors
-          closeButton
-          toastOptions={{
-            style: {
-              background: 'var(--background-elevated)',
-              border: '1px solid var(--border)',
-              color: 'var(--foreground)',
-            },
-          }}
-        />
+        <NeuralWrapper>
+          {children}
+          <Toaster
+            position="bottom-right"
+            theme="dark"
+            richColors
+            closeButton
+            toastOptions={{
+              style: {
+                background: 'var(--background-elevated)',
+                border: '1px solid var(--border)',
+                color: 'var(--foreground)',
+              },
+            }}
+          />
+        </NeuralWrapper>
       </body>
     </html>
   );

@@ -475,21 +475,21 @@ export const ThinkingIndicator: React.FC<ThinkingIndicatorProps> = ({
                   key="activities"
                   initial={{ opacity: 0, y: 10 }}
                   animate={{ opacity: 1, y: 0 }}
-                  className="space-y-2.5"
+                  className="grid grid-cols-1 gap-2" // Changed to grid, could be grid-cols-2 for compact parallel view if many
                 >
                   {activities.map((activity, idx) => activity && (
                     <motion.div
                       key={activity.key}
-                      initial={{ opacity: 0, x: -20 }}
-                      animate={{ opacity: 1, x: 0 }}
-                      transition={{ delay: idx * 0.1 }}
+                      initial={{ opacity: 0, scale: 0.9 }}
+                      animate={{ opacity: 1, scale: 1 }}
+                      transition={{ delay: idx * 0.05 }}
                       className={`
-                        flex items-center gap-2.5 text-xs p-2 rounded-lg
+                        flex items-center gap-2.5 text-xs p-2.5 rounded-xl border
                         ${activity.isCompleted
-                          ? 'bg-[var(--success)]/10 text-[var(--success)]'
+                          ? 'bg-[var(--success)]/5 text-[var(--success)] border-[var(--success)]/20'
                           : activity.isCurrent
-                            ? 'bg-[var(--accent)]/10 text-[var(--accent)]'
-                            : 'text-[var(--foreground-muted)]'
+                            ? 'bg-[var(--accent)]/10 text-[var(--accent)] border-[var(--accent)]/30 shadow-[0_0_15px_rgba(139,92,246,0.15)]'
+                            : 'text-[var(--foreground-muted)] border-transparent'
                         }
                       `}
                     >
@@ -511,14 +511,14 @@ export const ThinkingIndicator: React.FC<ThinkingIndicatorProps> = ({
                       ) : (
                         activity.icon
                       )}
-                      <span className="font-medium">{activity.label}</span>
+                      <span className="font-medium truncate">{activity.label}</span>
                       {activity.isCompleted && (
                         <motion.span
                           initial={{ opacity: 0 }}
                           animate={{ opacity: 1 }}
                           className="text-[10px] ml-auto opacity-70"
                         >
-                          Done
+                          {/* Done */}
                         </motion.span>
                       )}
                     </motion.div>
