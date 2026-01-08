@@ -1563,7 +1563,7 @@ function BlueprintCard({ blueprint }: BlueprintCardProps) {
         action: 'download',
         metadata: {
           blueprintId: blueprint.id,
-          blueprintName: blueprint.name,
+          blueprintName: blueprint.title,
           filename: pdfFilename,
           url: pdfUrl,
         },
@@ -1575,7 +1575,7 @@ function BlueprintCard({ blueprint }: BlueprintCardProps) {
         action: 'download_failed',
         metadata: {
           blueprintId: blueprint.id,
-          blueprintName: blueprint.name,
+          blueprintName: blueprint.title,
         },
       });
       // Show user-friendly message instead of redirecting

@@ -30,8 +30,6 @@
     "@radix-ui/react-slot": "^1.2.4",
     "@sentry/nextjs": "^10.29.0",
     "@tanstack/react-virtual": "^3.13.13",
-    "@tsparticles/react": "^3.0.0",
-    "@tsparticles/slim": "^3.9.1",
     "@types/dompurify": "^3.0.5",
     "ai": "^6.0.3",
     "class-variance-authority": "^0.7.1",
@@ -43,15 +41,12 @@
     "lucide-react": "^0.556.0",
     "next": "^16.0.10",
     "next-mdx-remote": "^5.0.0",
-    "puppeteer": "^24.33.0",
     "react": "19.2.3",
-    "react-confetti": "^6.4.0",
     "react-countup": "^6.5.3",
     "react-dom": "^19.2.3",
     "react-markdown": "^10.1.0",
     "react-type-animation": "^3.2.0",
     "remark-gfm": "^4.0.1",
-    "sal.js": "^0.8.5",
     "sonner": "^2.0.7",
     "tailwind-merge": "^3.4.0"
   },
@@ -61,6 +56,8 @@
     ]
   },
   "devDependencies": {
+    "@next/bundle-analyzer": "^16.1.1",
+    "puppeteer": "^24.33.0",
     "@playwright/test": "^1.57.0",
     "@tailwindcss/postcss": "^4",
     "@testing-library/dom": "^10.4.1",
