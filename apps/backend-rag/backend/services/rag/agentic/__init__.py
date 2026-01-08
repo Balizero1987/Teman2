@@ -38,6 +38,7 @@ from services.rag.agent.mcp_tool import MCPSuperTool
 from services.rag.agentic.graph_tool import GraphTraversalTool
 from services.search.semantic_cache import SemanticCache
 
+from services.tools.intel_management import IntelManagementTool
 from .orchestrator import AgenticRAGOrchestrator
 from .pipeline import (
     CitationStage,
@@ -139,6 +140,7 @@ def create_agentic_rag(
         ImageGenerationTool(),  # SEVENTH: Image generation (Imagen)
         WebSearchTool(),  # EIGHTH: Web search for out-of-KB queries (Brave)
         TimeSheetTool(),  # NINTH: Timesheet Management
+        IntelManagementTool(),  # TENTH: Intelligence Center Management
     ]
     logger.debug("create_agentic_rag: Tools list created")
 

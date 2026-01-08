@@ -6,6 +6,7 @@ Centralizes all router inclusion logic
 from fastapi import FastAPI
 
 from app.modules.identity.router import router as identity_router
+from app.modules.intel.router import router as intel_config_router
 from app.modules.knowledge.router import router as knowledge_router
 from app.routers import (
     agentic_rag,
@@ -114,6 +115,7 @@ def include_routers(api: FastAPI) -> None:
 
     # Intelligence & Oracle routers
     api.include_router(intel.router)
+    api.include_router(intel_config_router, prefix="/api/config")
     api.include_router(oracle_universal.router)
 
     # Communication routers (notifications/whatsapp/instagram removed - will be MCP)
