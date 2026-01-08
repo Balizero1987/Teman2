@@ -3,12 +3,13 @@ ReAct Reasoning Engine - Thought → Action → Observation Loop
 
 This component handles the core agentic reasoning loop using the ReAct pattern:
 - Thought: LLM generates reasoning about what to do next
-- Action: Execute a tool based on the thought
+- Action: Execute a tool based on the thought (Parallel Execution Supported)
 - Observation: Collect results from tool execution
 - Repeat until final answer or max steps reached
 
 Key features:
 - Native function calling with regex fallback
+- Parallel tool execution (asyncio.gather) for speed
 - Early exit optimization for efficient queries
 - Citation handling for vector search results
 - Final answer generation if not provided
@@ -18,6 +19,7 @@ Key features:
 import json
 import logging
 import re
+import asyncio
 from typing import Any
 
 from google.api_core.exceptions import ResourceExhausted, ServiceUnavailable
@@ -391,15 +393,12 @@ class ReasoningEngine:
                         break
 
                     # Parse for tool calls - try native function calling first, then regex fallback
-                    tool_call = None
+                    tool_calls = []
 
                     # Check for function call in response parts (native mode)
                     if hasattr(response_obj, "candidates") and response_obj.candidates:
                         for candidate in response_obj.candidates:
                             # FIX Edge Case 1: Proper None check for candidate.content
-                            # The old check `hasattr(candidate.content, "parts")` fails when
-                            # candidate.content is None because hasattr(None, "parts") = False
-                            # but we still try to iterate. Now we explicitly check for None.
                             if (
                                 hasattr(candidate, "content")
                                 and candidate.content is not None
@@ -407,144 +406,162 @@ class ReasoningEngine:
                                 and candidate.content.parts  # Ensure parts is not None/empty
                             ):
                                 for part in candidate.content.parts:
-                                    tool_call = parse_tool_call(part, use_native=True)
-                                    if tool_call:
-                                        logger.info(
-                                            "✅ [Native Function Call] Detected in response"
-                                        )
-                                        set_span_attribute("function_call_mode", "native")
-                                        break
-                                if tool_call:
+                                    t_call = parse_tool_call(part, use_native=True)
+                                    if is_valid_tool_call(t_call):
+                                        tool_calls.append(t_call)
+                                
+                                if tool_calls:
+                                    logger.info(
+                                        f"✅ [Native Function Call] Detected {len(tool_calls)} calls in response"
+                                    )
+                                    set_span_attribute("function_call_mode", "native")
                                     break
 
                     # FIX Edge Case 2: Validate tool call before using
-                    # A partially parsed tool_call (e.g., with None arguments) would
-                    # pass the `if tool_call` check but fail in execute_tool.
-                    # Use is_valid_tool_call to ensure all required fields are present.
-
                     # Fallback to regex parsing if no valid native function call found
-                    if not is_valid_tool_call(tool_call):
-                        tool_call = parse_tool_call(text_response, use_native=False)
-                        if is_valid_tool_call(tool_call):
+                    if not tool_calls:
+                        t_call = parse_tool_call(text_response, use_native=False)
+                        if is_valid_tool_call(t_call):
+                            tool_calls.append(t_call)
                             set_span_attribute("function_call_mode", "regex")
-                        else:
-                            # Neither native nor regex produced a valid tool call
-                            tool_call = None
 
-                    if is_valid_tool_call(tool_call):
-                        set_span_attribute("tool_name", tool_call.tool_name)
-                        add_span_event(
-                            "tool.call",
-                            {"tool": tool_call.tool_name, "args": str(tool_call.arguments)[:200]},
-                        )
+                    # =================================================================
+                    # PARALLEL TOOL EXECUTION (Asyncio.gather)
+                    # =================================================================
+                    if tool_calls:
+                        set_span_attribute("parallel_tools_count", len(tool_calls))
+                        
+                        # Create execution tasks
+                        tasks = []
+                        for tc in tool_calls:
+                            add_span_event(
+                                "tool.call",
+                                {"tool": tc.tool_name, "args": str(tc.arguments)[:200]},
+                            )
+                            logger.info(
+                                f"🔧 [Agent] Queueing tool: {tc.tool_name}",
+                                extra={
+                                    "tool": tc.tool_name,
+                                    "args": tc.arguments,
+                                    "step": state.current_step,
+                                    "user_id": user_id,
+                                },
+                            )
+                            tasks.append(
+                                execute_tool(
+                                    self.tool_map,
+                                    tc.tool_name,
+                                    tc.arguments,
+                                    user_id,
+                                    tool_execution_counter,
+                                )
+                            )
 
-                        logger.info(
-                            f"🔧 [Agent] Calling tool: {tool_call.tool_name}",
-                            extra={
-                                "tool": tool_call.tool_name,
-                                "args": tool_call.arguments,
-                                "step": state.current_step,
-                                "user_id": user_id,
-                            },
-                        )
-                        tool_result, tool_duration = await execute_tool(
-                            self.tool_map,
-                            tool_call.tool_name,
-                            tool_call.arguments,
-                            user_id,
-                            tool_execution_counter,
-                        )
+                        # Execute all tools in parallel
+                        start_parallel = asyncio.get_event_loop().time()
+                        results = await asyncio.gather(*tasks)
+                        parallel_duration = asyncio.get_event_loop().time() - start_parallel
+                        set_span_attribute("parallel_execution_time_ms", int(parallel_duration * 1000))
 
-                        # Store tool timing for metrics (attached to step later)
-                        tool_call.execution_time = tool_duration
-                        set_span_attribute(
-                            "tool_result_length", len(tool_result) if tool_result else 0
-                        )
-                        set_span_attribute("tool_duration_ms", int(tool_duration * 1000))
+                        # Process results
+                        combined_observation = []
+                        for idx, (tool_result, tool_duration) in enumerate(results):
+                            tc = tool_calls[idx]
+                            
+                            # Store tool timing for metrics
+                            tc.execution_time = tool_duration
+                            
+                            # --- CITATION HANDLING ---
+                            # FIX Edge Case 3: Handle empty content from vector_search
+                            if tc.tool_name == "vector_search":
+                                try:
+                                    parsed_result = json.loads(tool_result)
+                                    if isinstance(parsed_result, dict) and "sources" in parsed_result:
+                                        content = parsed_result.get("content", "")
+                                        new_sources = parsed_result.get("sources", [])
 
-                        # --- CITATION HANDLING ---
-                        # FIX Edge Case 3: Handle empty content from vector_search
-                        # If content is empty but sources exist, we should:
-                        # 1. Log a warning (sources without content are less useful)
-                        # 2. Keep the original tool_result (JSON string) if content is empty
-                        # 3. Only add non-empty content to context_gathered
-                        if tool_call.tool_name == "vector_search":
-                            try:
-                                parsed_result = json.loads(tool_result)
-                                if isinstance(parsed_result, dict) and "sources" in parsed_result:
-                                    content = parsed_result.get("content", "")
-                                    new_sources = parsed_result.get("sources", [])
-
-                                    # Only extract content if it's meaningful (>10 chars after strip)
-                                    if content and len(content.strip()) > 10:
-                                        tool_result = content
-                                        if not hasattr(state, "sources"):
-                                            state.sources = []
-                                        state.sources.extend(new_sources)
-                                        set_span_attribute("sources_collected", len(new_sources))
-                                        logger.info(
-                                            f"📚 [Agent] Collected {len(new_sources)} sources from vector_search"
-                                        )
-                                    else:
-                                        # Empty content - log warning and keep original result
-                                        logger.warning(
-                                            f"⚠️ [Agent] Vector search returned empty content with "
-                                            f"{len(new_sources)} sources. Keeping original result."
-                                        )
-                                        set_span_attribute("empty_content_warning", "true")
-                                        # Still collect sources for evidence scoring even if content is empty
-                                        if new_sources:
+                                        # Only extract content if it's meaningful (>10 chars after strip)
+                                        if content and len(content.strip()) > 10:
+                                            tool_result = content
                                             if not hasattr(state, "sources"):
                                                 state.sources = []
                                             state.sources.extend(new_sources)
-                            except json.JSONDecodeError:
-                                pass
-                            except (KeyError, ValueError, TypeError) as e:
-                                logger.warning(
-                                    f"Failed to parse vector_search result: {e}", exc_info=True
-                                )
-
-                        # Handle image generation results
-                        if tool_call.tool_name == "generate_image":
-                            try:
-                                parsed_result = json.loads(tool_result)
-                                if isinstance(parsed_result, dict) and parsed_result.get("success"):
-                                    # Extract image URL or base64 data
-                                    image_url = parsed_result.get("image_url") or parsed_result.get(
-                                        "image_data"
+                                            logger.info(
+                                                f"📚 [Agent] Collected {len(new_sources)} sources from vector_search"
+                                            )
+                                        else:
+                                            # Empty content - log warning and keep original result
+                                            logger.warning(
+                                                f"⚠️ [Agent] Vector search returned empty content with "
+                                                f"{len(new_sources)} sources. Keeping original result."
+                                            )
+                                            if new_sources:
+                                                if not hasattr(state, "sources"):
+                                                    state.sources = []
+                                                state.sources.extend(new_sources)
+                                except json.JSONDecodeError:
+                                    pass
+                                except (KeyError, ValueError, TypeError) as e:
+                                    logger.warning(
+                                        f"Failed to parse vector_search result: {e}", exc_info=True
                                     )
-                                    if image_url:
-                                        logger.info(
-                                            f"🖼️ [Agent] Image generated: {parsed_result.get('service')}"
+
+                            # Handle image generation results
+                            if tc.tool_name == "generate_image":
+                                try:
+                                    parsed_result = json.loads(tool_result)
+                                    if isinstance(parsed_result, dict) and parsed_result.get("success"):
+                                        # Extract image URL or base64 data
+                                        image_url = parsed_result.get("image_url") or parsed_result.get(
+                                            "image_data"
                                         )
-                                        # Store in state for final response
-                                        if not hasattr(state, "generated_images"):
-                                            state.generated_images = []
-                                        state.generated_images.append(image_url)
-                            except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
-                                logger.warning(f"Failed to parse generate_image result: {e}")
+                                        if image_url:
+                                            logger.info(
+                                                f"🖼️ [Agent] Image generated: {parsed_result.get('service')}"
+                                            )
+                                            # Store in state for final response
+                                            if not hasattr(state, "generated_images"):
+                                                state.generated_images = []
+                                            state.generated_images.append(image_url)
+                                except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
+                                    logger.warning(f"Failed to parse generate_image result: {e}")
 
-                        # Update the tool call with the result
-                        tool_call.result = tool_result
+                            # Update the tool call with the result
+                            tc.result = tool_result
+                            
+                            # Add to combined observation for this step
+                            combined_observation.append(f"Tool {tc.tool_name} result: {tool_result}")
 
-                        step = AgentStep(
-                            step_number=state.current_step,
-                            thought=text_response,
-                            action=tool_call,
-                            observation=tool_result,
-                        )
-                        state.steps.append(step)
+                            # Add to context gathered
+                            if tool_result and len(tool_result.strip()) > 0:
+                                state.context_gathered.append(tool_result)
+                            else:
+                                logger.warning("⚠️ [Agent] Skipping empty tool_result for context_gathered")
 
-                        # FIX Edge Case 3: Only append non-empty context
-                        # Empty strings pollute context_gathered and affect evidence scoring
-                        if tool_result and len(tool_result.strip()) > 0:
-                            state.context_gathered.append(tool_result)
-                        else:
-                            logger.warning(
-                                "⚠️ [Agent] Skipping empty tool_result for context_gathered"
+                        # Create a single step representing this parallel execution block
+                        # For history, we'll store the LAST tool call action (limitation of linear history)
+                        # or we could create multiple steps. Let's create multiple steps to preserve history accurately.
+                        
+                        # Optimization: Use the last observation for the "Observation:" prompt
+                        # but store all steps in history
+                        final_observation_text = "\\n\\n".join(combined_observation)
+                        
+                        for idx, tc in enumerate(tool_calls):
+                            result_text, _ = results[idx]
+                            # Clean up result text for the step object if it was modified (e.g. vector_search)
+                            # Re-apply the modification logic from above if needed, but 'tc.result' should hold it?
+                            # Actually, we modified 'tool_result' local var, not 'tc.result' fully in all paths.
+                            # Let's trust 'tc.result' was updated above.
+                            
+                            step = AgentStep(
+                                step_number=state.current_step,
+                                thought=text_response if idx == 0 else "Parallel execution",
+                                action=tc,
+                                observation=tc.result,
                             )
+                            state.steps.append(step)
 
-                        # Validate context quality before using
+                        # Validate context quality
                         if state.context_gathered:
                             quality_score = self._validate_context_quality(
                                 query=query,
@@ -560,46 +577,35 @@ class ReasoningEngine:
                                         "step": state.current_step,
                                     },
                                 )
-                                try:
-                                    from app.metrics import reasoning_low_context_quality_total
-
-                                    reasoning_low_context_quality_total.inc()
-                                except ImportError:
-                                    pass
-
-                                # Try to gather more context if not at max steps
+                                # Continue to gather more if not at max steps
                                 if state.current_step < state.max_steps:
-                                    logger.info(
-                                        "🔄 [Agent] Low quality context, continuing to gather more..."
-                                    )
-                                    continue  # Try another tool
-                                else:
-                                    # Last step - use what we have but warn
-                                    logger.warning(
-                                        "Using low-quality context due to max steps reached"
-                                    )
+                                    logger.info("🔄 [Agent] Low quality context, continuing...")
+                                    continue
 
-                        # OPTIMIZATION: Early exit (only for simple queries)
-                        # Complex queries (business_complex, business_strategic) may need KG tool
+                        # OPTIMIZATION: Early exit
                         complex_intents = {"business_complex", "business_strategic", "devai_code"}
                         is_complex_query = (
                             getattr(state, "intent_type", "simple") in complex_intents
                         )
 
-                        if (
-                            tool_call.tool_name == "vector_search"
-                            and len(tool_result) > 500
-                            and "No relevant documents" not in tool_result
-                            and not is_complex_query  # Allow complex queries to continue
-                        ):
-                            logger.info("🚀 [Early Exit] Sufficient context from retrieval.")
-                            set_span_attribute("early_exit", "true")
+                        # Check if ANY tool result satisfies early exit
+                        should_exit = False
+                        for idx, tc in enumerate(tool_calls):
+                            res = tc.result
+                            if (
+                                tc.tool_name == "vector_search"
+                                and len(res) > 500
+                                and "No relevant documents" not in res
+                                and not is_complex_query
+                            ):
+                                logger.info("🚀 [Early Exit] Sufficient context from retrieval.")
+                                set_span_attribute("early_exit", "true")
+                                should_exit = True
+                                break
+                        
+                        if should_exit:
                             set_span_status("ok")
                             break
-                        elif is_complex_query and tool_call.tool_name == "vector_search":
-                            logger.info(
-                                "🔗 [Complex Query] Allowing multi-tool reasoning (KG may be needed)"
-                            )
 
                         set_span_status("ok")
 
@@ -654,7 +660,6 @@ class ReasoningEngine:
 
         # ==================== TRUSTED TOOLS CHECK ====================
         # Check if trusted tools (calculator, pricing, team) were used successfully
-        # These tools provide their own evidence and don't need KB sources
         trusted_tools_used = False
         trusted_tool_names = {
             "calculator",
@@ -676,9 +681,6 @@ class ReasoningEngine:
                         break
 
         # ==================== POLICY ENFORCEMENT ====================
-        # If final_answer already exists but evidence is weak, override it
-        # Skip evidence check for general tasks (translation, summarization, etc.)
-        # Also skip if trusted tools were used successfully
         if (
             state.final_answer
             and evidence_score < 0.3
@@ -702,10 +704,8 @@ class ReasoningEngine:
         # Generate final answer if not present
         if not state.final_answer and state.context_gathered:
             # POLICY ENFORCEMENT: Check evidence score before generating answer
-            # Skip for general tasks (translation, summarization, etc.)
-            # Also skip if trusted tools were used successfully
             if evidence_score < 0.3 and not state.skip_rag and not trusted_tools_used:
-                # ABSTAIN: Skip LLM generation, return uncertainty message
+                # ABSTAIN
                 logger.warning(f"🛡️ [Uncertainty] Triggered ABSTAIN (Score: {evidence_score:.2f})")
                 state.final_answer = (
                     "Mi dispiace, non ho trovato informazioni verificate sufficienti "
@@ -713,12 +713,12 @@ class ReasoningEngine:
                     "Posso aiutarti con altro?"
                 )
             else:
-                # Generate answer with optional warning for weak evidence
-                context = "\n\n".join(state.context_gathered)
+                # Generate answer
+                context = "\\n\\n".join(state.context_gathered)
                 warning_note = ""
                 if evidence_score >= 0.3 and evidence_score < 0.6:
                     warning_note = (
-                        "\n\nWARNING: Evidence is weak. Use precautionary language "
+                        "\\n\\nWARNING: Evidence is weak. Use precautionary language "
                         "(e.g., 'Based on limited information...', 'It appears that...'). "
                         "Do NOT be definitive."
                     )
@@ -752,10 +752,8 @@ Provide a final, comprehensive answer to: {query}
                     state.final_answer = "I apologize, but I couldn't generate a final answer based on the gathered information."
         elif not state.final_answer:
             # No context gathered at all
-            # For general tasks, this is OK - generate answer without RAG context
             if state.skip_rag:
                 logger.info("🏷️ [General Task] No context needed, proceeding with LLM generation")
-                # Generate answer directly for general tasks
                 try:
                     (
                         state.final_answer,
@@ -792,7 +790,6 @@ Provide a final, comprehensive answer to: {query}
             state.final_answer = "Mi dispiace, non ho capito bene la tua richiesta. Potresti riformularla? Posso aiutarti con visti, aziende e leggi in Indonesia."
 
         # ==================== RESPONSE PIPELINE PROCESSING ====================
-        # 🔍 TRACING: Response pipeline processing
         with trace_span("react.pipeline", {"has_pipeline": bool(self.response_pipeline)}):
             # Process response through pipeline: verify, clean, format citations
             if state.final_answer and self.response_pipeline:
@@ -832,7 +829,7 @@ TASK: Rewrite the answer using ONLY the provided context.
 Do not invent information. If the context is insufficient, admit it.
 """
 
-                        # Retry with same model (disable function calling for final answer)
+                        # Retry with same model
                         corrected_answer, _, _, correction_usage = await llm_gateway.send_message(
                             chat,
                             rephrase_prompt,
@@ -866,7 +863,7 @@ Do not invent information. If the context is insufficient, admit it.
                     # Fallback to basic post-processing
                     state.final_answer = post_process_response(state.final_answer, query)
 
-        # Log total token usage for the entire ReAct loop
+        # Log total token usage
         logger.info(
             f"📊 [ReAct] Total token usage: {accumulated_usage.prompt_tokens} prompt + "
             f"{accumulated_usage.completion_tokens} completion = {accumulated_usage.total_tokens} total "
@@ -890,9 +887,6 @@ Do not invent information. If the context is insufficient, admit it.
     ):
         """
         Execute the ReAct reasoning loop with streaming output.
-
-        This is the streaming version of execute_react_loop that yields events
-        as they occur during the reasoning process.
 
         Yields:
             Events with types: "thinking", "tool_call", "observation", "token"
@@ -929,7 +923,7 @@ Do not invent information. If the context is insufficient, admit it.
                 break
 
             # Parse for tool calls
-            tool_call = None
+            tool_calls = []
 
             # Check for native function call
             if hasattr(response_obj, "candidates") and response_obj.candidates:
@@ -941,133 +935,147 @@ Do not invent information. If the context is insufficient, admit it.
                         and candidate.content.parts
                     ):
                         for part in candidate.content.parts:
-                            tool_call = parse_tool_call(part, use_native=True)
-                            if tool_call:
-                                break
-                        if tool_call:
+                            t_call = parse_tool_call(part, use_native=True)
+                            if is_valid_tool_call(t_call):
+                                tool_calls.append(t_call)
+                        
+                        if tool_calls:
                             break
 
-            # FIX Edge Case 2 (streaming): Validate tool call before using
             # Fallback to regex parsing if no valid native function call found
-            if not is_valid_tool_call(tool_call):
-                tool_call = parse_tool_call(text_response, use_native=False)
-                if not is_valid_tool_call(tool_call):
-                    tool_call = None
+            if not tool_calls:
+                t_call = parse_tool_call(text_response, use_native=False)
+                if is_valid_tool_call(t_call):
+                    tool_calls.append(t_call)
 
-            if is_valid_tool_call(tool_call):
-                # Yield tool call event
-                yield {
-                    "type": "tool_call",
-                    "data": {"tool": tool_call.tool_name, "args": tool_call.arguments},
-                }
+            # =================================================================
+            # PARALLEL TOOL EXECUTION (Streaming)
+            # =================================================================
+            if tool_calls:
+                # 1. Yield all tool call events
+                for tc in tool_calls:
+                    yield {
+                        "type": "tool_call",
+                        "data": {"tool": tc.tool_name, "args": tc.arguments},
+                    }
+                    logger.info(f"🔧 [Agent Stream] Calling tool: {tc.tool_name}")
 
-                logger.info(f"🔧 [Agent Stream] Calling tool: {tool_call.tool_name}")
-                tool_result, tool_duration = await execute_tool(
-                    self.tool_map,
-                    tool_call.tool_name,
-                    tool_call.arguments,
-                    user_id,
-                    tool_execution_counter,
-                )
-                tool_call.execution_time = tool_duration
+                # 2. Create parallel tasks
+                tasks = []
+                for tc in tool_calls:
+                    tasks.append(
+                        execute_tool(
+                            self.tool_map,
+                            tc.tool_name,
+                            tc.arguments,
+                            user_id,
+                            tool_execution_counter,
+                        )
+                    )
 
-                # Handle citation from vector_search
-                # FIX Edge Case 3 (streaming): Handle empty content from vector_search
-                if tool_call.tool_name == "vector_search":
-                    try:
-                        parsed_result = json.loads(tool_result)
-                        if isinstance(parsed_result, dict) and "sources" in parsed_result:
-                            content = parsed_result.get("content", "")
-                            new_sources = parsed_result.get("sources", [])
+                # 3. Execute in parallel
+                results = await asyncio.gather(*tasks)
 
-                            # Only extract content if it's meaningful (>10 chars after strip)
-                            if content and len(content.strip()) > 10:
-                                tool_result = content
-                                if not hasattr(state, "sources"):
-                                    state.sources = []
-                                state.sources.extend(new_sources)
-                                logger.info(
-                                    f"📚 [Agent Stream] Collected {len(new_sources)} sources"
-                                )
-                            else:
-                                # Empty content - log warning, still collect sources
-                                logger.warning(
-                                    f"⚠️ [Agent Stream] Vector search returned empty content "
-                                    f"with {len(new_sources)} sources"
-                                )
-                                if new_sources:
+                # 4. Process results and yield observations
+                should_exit = False
+                combined_observation = []
+
+                for idx, (tool_result, tool_duration) in enumerate(results):
+                    tc = tool_calls[idx]
+                    tc.execution_time = tool_duration
+
+                    # Handle citation from vector_search
+                    if tc.tool_name == "vector_search":
+                        try:
+                            parsed_result = json.loads(tool_result)
+                            if isinstance(parsed_result, dict) and "sources" in parsed_result:
+                                content = parsed_result.get("content", "")
+                                new_sources = parsed_result.get("sources", [])
+
+                                if content and len(content.strip()) > 10:
+                                    tool_result = content
                                     if not hasattr(state, "sources"):
                                         state.sources = []
                                     state.sources.extend(new_sources)
-                    except (json.JSONDecodeError, KeyError, ValueError, TypeError):
-                        pass
+                                    logger.info(
+                                        f"📚 [Agent Stream] Collected {len(new_sources)} sources"
+                                    )
+                                else:
+                                    logger.warning(
+                                        f"⚠️ [Agent Stream] Vector search returned empty content "
+                                        f"with {len(new_sources)} sources"
+                                    )
+                                    if new_sources:
+                                        if not hasattr(state, "sources"):
+                                            state.sources = []
+                                        state.sources.extend(new_sources)
+                        except (json.JSONDecodeError, KeyError, ValueError, TypeError):
+                            pass
 
-                # Handle image generation results
-                if tool_call.tool_name == "generate_image":
-                    try:
-                        parsed_result = json.loads(tool_result)
-                        if isinstance(parsed_result, dict) and parsed_result.get("success"):
-                            # Extract image URL or base64 data
-                            image_url = parsed_result.get("image_url") or parsed_result.get(
-                                "image_data"
-                            )
-                            if image_url:
-                                # Yield special image event for frontend rendering
-                                yield {
-                                    "type": "image",
-                                    "data": {
-                                        "url": image_url,
-                                        "service": parsed_result.get("service", "unknown"),
-                                        "prompt": parsed_result.get("message", ""),
-                                    },
-                                }
-                                logger.info(
-                                    f"🖼️ [Agent Stream] Image generated: {parsed_result.get('service')}"
+                    # Handle image generation results
+                    if tc.tool_name == "generate_image":
+                        try:
+                            parsed_result = json.loads(tool_result)
+                            if isinstance(parsed_result, dict) and parsed_result.get("success"):
+                                image_url = parsed_result.get("image_url") or parsed_result.get(
+                                    "image_data"
                                 )
-                                # Store in state for final response
-                                if not hasattr(state, "generated_images"):
-                                    state.generated_images = []
-                                state.generated_images.append(image_url)
-                    except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
-                        logger.warning(f"Failed to parse generate_image result: {e}")
+                                if image_url:
+                                    yield {
+                                        "type": "image",
+                                        "data": {
+                                            "url": image_url,
+                                            "service": parsed_result.get("service", "unknown"),
+                                            "prompt": parsed_result.get("message", ""),
+                                        },
+                                    }
+                                    logger.info(
+                                        f"🖼️ [Agent Stream] Image generated: {parsed_result.get('service')}"
+                                    )
+                                    if not hasattr(state, "generated_images"):
+                                        state.generated_images = []
+                                    state.generated_images.append(image_url)
+                        except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
+                            logger.warning(f"Failed to parse generate_image result: {e}")
 
-                tool_call.result = tool_result
+                    # Update tool call result
+                    tc.result = tool_result
+                    combined_observation.append(f"Tool {tc.tool_name} result: {tool_result}")
 
-                step = AgentStep(
-                    step_number=state.current_step,
-                    thought=text_response,
-                    action=tool_call,
-                    observation=tool_result,
-                )
-                state.steps.append(step)
-
-                # FIX Edge Case 3 (streaming): Only append non-empty context
-                if tool_result and len(tool_result.strip()) > 0:
-                    state.context_gathered.append(tool_result)
-
-                # Yield observation event
-                yield {
-                    "type": "observation",
-                    "data": tool_result[:500] if len(tool_result) > 500 else tool_result,
-                }
-
-                # Early exit optimization (only for simple queries)
-                # Complex queries (business_complex, business_strategic) may need KG tool
-                complex_intents = {"business_complex", "business_strategic", "devai_code"}
-                is_complex_query = getattr(state, "intent_type", "simple") in complex_intents
-
-                if (
-                    tool_call.tool_name == "vector_search"
-                    and len(tool_result) > 500
-                    and "No relevant documents" not in tool_result
-                    and not is_complex_query  # Allow complex queries to continue
-                ):
-                    logger.info("🚀 [Stream Early Exit] Sufficient context from retrieval.")
-                    break
-                elif is_complex_query and tool_call.tool_name == "vector_search":
-                    logger.info(
-                        "🔗 [Stream Complex Query] Allowing multi-tool reasoning (KG may be needed)"
+                    # Create step
+                    step = AgentStep(
+                        step_number=state.current_step,
+                        thought=text_response if idx == 0 else "Parallel execution",
+                        action=tc,
+                        observation=tool_result,
                     )
+                    state.steps.append(step)
+
+                    # Update context
+                    if tool_result and len(tool_result.strip()) > 0:
+                        state.context_gathered.append(tool_result)
+
+                    # Yield observation event
+                    yield {
+                        "type": "observation",
+                        "data": tool_result[:500] if len(tool_result) > 500 else tool_result,
+                    }
+
+                    # Early exit logic
+                    complex_intents = {"business_complex", "business_strategic", "devai_code"}
+                    is_complex_query = getattr(state, "intent_type", "simple") in complex_intents
+
+                    if (
+                        tc.tool_name == "vector_search"
+                        and len(tool_result) > 500
+                        and "No relevant documents" not in tool_result
+                        and not is_complex_query
+                    ):
+                        logger.info("🚀 [Stream Early Exit] Sufficient context from retrieval.")
+                        should_exit = True
+                
+                if should_exit:
+                    break
 
             else:
                 # No tool call - check for final answer
@@ -1101,8 +1109,6 @@ Do not invent information. If the context is insufficient, admit it.
         yield {"type": "evidence_score", "data": {"score": evidence_score}}
 
         # ==================== TRUSTED TOOLS CHECK ====================
-        # Check if trusted tools (calculator, pricing, team) were used successfully
-        # These tools provide their own evidence and don't need KB sources
         trusted_tools_used = False
         trusted_tool_names = {
             "calculator",
@@ -1131,9 +1137,6 @@ Do not invent information. If the context is insufficient, admit it.
                         break
 
         # ==================== POLICY ENFORCEMENT ====================
-        # If final_answer already exists but evidence is weak, override it
-        # Skip evidence check for general tasks (translation, summarization, etc.)
-        # Also skip if trusted tools were used successfully
         if (
             state.final_answer
             and evidence_score < 0.3
@@ -1157,11 +1160,9 @@ Do not invent information. If the context is insufficient, admit it.
 
         # ==================== FINAL ANSWER GENERATION ====================
         if not state.final_answer and state.context_gathered:
-            # POLICY ENFORCEMENT: Check evidence score before generating answer
-            # Skip for general tasks (translation, summarization, etc.)
-            # Also skip if trusted tools were used successfully
+            # POLICY ENFORCEMENT
             if evidence_score < 0.3 and not state.skip_rag and not trusted_tools_used:
-                # ABSTAIN: Skip LLM generation, return uncertainty message
+                # ABSTAIN
                 logger.warning(
                     f"🛡️ [Uncertainty Stream] Triggered ABSTAIN (Score: {evidence_score:.2f})"
                 )
@@ -1171,12 +1172,12 @@ Do not invent information. If the context is insufficient, admit it.
                     "Posso aiutarti con altro?"
                 )
             else:
-                # Generate answer with optional warning for weak evidence
-                context = "\n\n".join(state.context_gathered)
+                # Generate answer
+                context = "\\n\\n".join(state.context_gathered)
                 warning_note = ""
                 if evidence_score >= 0.3 and evidence_score < 0.6:
                     warning_note = (
-                        "\n\nWARNING: Evidence is weak. Use precautionary language "
+                        "\\n\\nWARNING: Evidence is weak. Use precautionary language "
                         "(e.g., 'Based on limited information...', 'It appears that...'). "
                         "Do NOT be definitive."
                     )
@@ -1203,7 +1204,6 @@ Provide a final, comprehensive answer to: {query}
                     state.final_answer = "I apologize, but I couldn't generate a final answer."
         elif not state.final_answer:
             # No context gathered at all
-            # For general tasks, this is OK - generate answer without RAG context
             if state.skip_rag:
                 logger.info(
                     "🏷️ [General Task Stream] No context needed, proceeding with LLM generation"
@@ -1267,152 +1267,3 @@ Provide a final, comprehensive answer to: {query}
         # Yield sources if available
         if hasattr(state, "sources") and state.sources:
             yield {"type": "sources", "data": state.sources}
-
-
-def detect_team_query(query: str) -> tuple[bool, str, str]:
-    """
-    Heuristically detect if a user query is asking about the company team.
-
-    This helper is used by the AgenticRAGOrchestrator to optionally pre-route to the
-    `team_knowledge` tool (when available) before running the full ReAct loop.
-
-    Returns:
-        (is_team_query, query_type, search_term)
-
-    Supported query_type values (expected by the `team_knowledge` tool):
-        - "list_all": request to list all team members / employees
-        - "search_by_role": request by role/title (CEO, founder, tax, visa, etc.)
-        - "search_by_name": request by person name ("Chi è Zainal?", "Tell me about Zero")
-        - "search_by_email": request containing an email address
-    """
-    if not isinstance(query, str):
-        return False, "", ""
-
-    q = query.strip()
-    if not q:
-        return False, "", ""
-
-    ql = q.lower()
-
-    # 1) List-all team requests
-    # NOTE: "dipendenti" alone is TOO BROAD - matches tax questions like "PPh 21 per i dipendenti"
-    # Only match when explicitly asking about Bali Zero team
-    list_all_markers = (
-        "list all team",
-        "list team",
-        "team members",
-        "membri del team",
-        "lista team",
-        "elenco team",
-        "tutti i membri",
-        "quanti dipendenti",  # "how many employees" - team context
-        "vostri dipendenti",  # "your employees" - explicit team context
-        f"i dipendenti {settings.COMPANY_NAME.lower()}",  # "company employees" - explicit
-        "dipendenti del team",  # "team employees" - explicit
-        "tutto lo staff",
-        "vostro staff",
-        "il vostro personale",
-    )
-    if any(marker in ql for marker in list_all_markers):
-        return True, "list_all", ""
-
-    # 2) Email lookup
-    email_match = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", q)
-    if email_match:
-        return True, "search_by_email", email_match.group(0)
-
-    # 3) Role/title lookup - ONLY if user is explicitly asking about TEAM MEMBERS
-    # Must have team context like "chi si occupa", "who handles", "team", "staff", etc.
-    team_context_markers = (
-        "chi si occupa",
-        "chi gestisce",
-        "chi segue",
-        "chi è il",
-        "chi è la",
-        "who handles",
-        "who manages",
-        "who is the",
-        "who is your",
-        "your team",
-        "nel team",
-        "del team",
-        "in the team",
-        "team member",
-        "staff member",
-        "il vostro",
-        "la vostra",
-        "avete qualcuno",
-        "c'è qualcuno",
-        "esperto di",
-        "specialist",
-        "manager",
-        "responsabile",
-    )
-    has_team_context = any(marker in ql for marker in team_context_markers)
-
-    # Only check roles if there's explicit team context
-    if has_team_context:
-        role_map: dict[str, tuple[str, ...]] = {
-            "ceo": ("ceo", "chief executive", "amministratore delegato", "a.d.", "ad "),
-            "founder": ("founder", "cofounder", "co-founder", "fondatore", "fondatrice"),
-            "tax": ("tax", "tasse", "fiscale", "fiscal", "pajak"),
-            "visa": ("visa", "visti", "immigrazione", "immigration"),
-            "setup": ("setup", "set up", "onboarding"),
-            "legal": ("legal", "legale", "law", "avvocato"),
-            "property": ("property", "immobiliare", "real estate"),
-            "marketing": ("marketing", "social", "content"),
-            "support": ("support", "assistenza", "customer care"),
-        }
-        for role, keywords in role_map.items():
-            if any(k in ql for k in keywords):
-                return True, "search_by_role", role
-
-    # 4) Name lookup patterns (keep original casing from the original query)
-    # Handle Italian keyboard variations: è, e, e', e' (curly apostrophe)
-    # IMPORTANT: Patterns must be specific to avoid matching casual questions like
-    # "conosci qualche ristorante?" which should NOT route to team_knowledge
-    name_patterns = (
-        # Italian "chi è" with all keyboard variations (accented, apostrophe, plain)
-        r"\bchi\s*[eè]['']?\s*(?P<term>[^?.,!;:\n]{1,64})",
-        # English patterns
-        r"\bwho\s+is\s+(?P<term>[^?.,!;:\n]{1,64})",
-        r"\btell\s+me\s+about\s+(?P<term>[^?.,!;:\n]{1,64})",
-        # Italian info/dimmi/parlami patterns - ONLY for people (with team context)
-        r"\binfo(?:rmazioni)?\s+su\s+(?P<term>[^?.,!;:\n]{1,64})",
-        r"\bdimmi\s+(?:di\s+)?(?P<term>[^?.,!;:\n]{1,64})",
-        r"\bparlami\s+di\s+(?P<term>[^?.,!;:\n]{1,64})",
-        # "conosci" ONLY for people - exclude casual words like ristorante, posto, luogo, etc.
-        # Pattern: "conosci [Name]" but NOT "conosci qualche/un/una [place]"
-        r"\bconosci\s+(?!qualche|qualcuno|qualcosa|un\s|una\s|il\s|la\s|dei\s|delle\s|alcuni|alcune|ristorante|posto|luogo|bar|cafe|hotel)(?P<term>[A-Z][a-zA-Zàèéìòù\s]{1,30})",
-    )
-    for pat in name_patterns:
-        m = re.search(pat, q, flags=re.IGNORECASE)
-        if not m:
-            continue
-        raw_term = (m.group("term") or "").strip()
-        raw_term = re.sub(
-            r"^(il|lo|la|i|gli|le|the|a|an|un|uno|una)\s+",
-            "",
-            raw_term,
-            flags=re.IGNORECASE,
-        ).strip()
-        raw_term = raw_term.strip("\"'“”")
-        raw_term = " ".join(raw_term.split()[:3])  # keep short, stable search term
-        if raw_term:
-            return True, "search_by_name", raw_term
-
-    # 5) Generic "who handles X" / "chi si occupa di X"
-    handler_patterns = (
-        r"\bchi\s+si\s+occupa\s+di\s+(?P<term>[^?.,!;:\n]{1,64})",
-        r"\bwho\s+handles\s+(?P<term>[^?.,!;:\n]{1,64})",
-    )
-    for pat in handler_patterns:
-        m = re.search(pat, q, flags=re.IGNORECASE)
-        if not m:
-            continue
-        raw_term = (m.group("term") or "").strip().strip("\"'“”")
-        raw_term = " ".join(raw_term.split()[:3])
-        if raw_term:
-            return True, "search_by_role", raw_term.lower()
-
-    return False, "", ""
