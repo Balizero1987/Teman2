@@ -90,6 +90,11 @@ rag_queries_total = Counter(
 rag_tool_calls_total = Counter(
     "zantara_rag_tool_calls_total", "Total tool calls in agentic RAG", ["tool_name", "status"]
 )
+rag_parallel_batch_size = Histogram(
+    "zantara_rag_parallel_batch_size",
+    "Number of tools executed in parallel batch",
+    buckets=[1, 2, 3, 5, 10]
+)
 rag_fallback_count = Counter(
     "zantara_rag_fallback_count_total", "LLM model fallback events", ["from_model", "to_model"]
 )
@@ -619,6 +624,14 @@ class MetricsCollector:
             status: Call outcome ('success', 'error', 'timeout')
         """
         rag_tool_calls_total.labels(tool_name=tool_name, status=status).inc()
+
+    def record_parallel_execution(self, batch_size: int):
+        """Record the size of a parallel tool execution batch.
+
+        Args:
+            batch_size: Number of tools executed in parallel
+        """
+        rag_parallel_batch_size.observe(batch_size)
 
     def record_llm_fallback(self, from_model: str, to_model: str):
         """Record an LLM model fallback event.
