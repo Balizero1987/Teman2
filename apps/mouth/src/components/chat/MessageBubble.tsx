@@ -44,16 +44,16 @@ interface MessageBubbleProps {
 const VerificationBadge = ({ score }: { score: number }) => {
   let colorClass = 'text-[var(--error)] border-[var(--error)]/30 bg-[var(--error)]/10';
   let icon = <ShieldAlert className="w-3 h-3" />;
-  let label = 'Low Confidence';
+  let label = 'Low Evidence';
 
   if (score >= 80) {
     colorClass = 'text-[var(--success)] border-[var(--success)]/30 bg-[var(--success)]/10';
     icon = <ShieldCheck className="w-3 h-3" />;
-    label = 'Verified';
+    label = 'Verified Evidence';
   } else if (score >= 50) {
     colorClass = 'text-[var(--warning)] border-[var(--warning)]/30 bg-[var(--warning)]/10';
     icon = <Shield className="w-3 h-3" />;
-    label = 'Medium Confidence';
+    label = 'Medium Evidence';
   }
 
   return (
@@ -61,8 +61,9 @@ const VerificationBadge = ({ score }: { score: number }) => {
       className={`
       inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full
       text-[10px] font-medium border ${colorClass}
-      mt-2 select-none
+      mt-2 select-none cursor-help
     `}
+      title="Evidence Score: Based on quantity and quality of source documents found."
     >
       {icon}
       <span>
@@ -153,7 +154,7 @@ const EmotionalBadge = ({ emotion }: { emotion: string }) => {
 };
 
 function MessageBubbleComponent({ message, userAvatar, isLast, onFollowUpClick }: MessageBubbleProps) {
-  const { role, content, sources, imageUrl, timestamp, steps, verification_score } = message;
+  const { role, content, sources, imageUrl, timestamp, steps, verification_score, evidence_score } = message;
   const isUser = role === 'user';
   const [copied, setCopied] = useState(false);
   const [isThinkingExpanded, setIsThinkingExpanded] = useState(false);
@@ -440,9 +441,9 @@ function MessageBubbleComponent({ message, userAvatar, isLast, onFollowUpClick }
               <ReactMarkdown remarkPlugins={[remarkGfm]}>{displayedContent}</ReactMarkdown>
             </div>
 
-            {/* Verification Badge */}
-            {!isUser && verification_score !== undefined && (
-              <VerificationBadge score={verification_score} />
+            {/* Evidence/Verification Badge */}
+            {!isUser && (evidence_score !== undefined || verification_score !== undefined) && (
+              <VerificationBadge score={Math.round((evidence_score ?? verification_score ?? 0) * 100)} />
             )}
 
             {/* Pricing Table */}

@@ -52,6 +52,7 @@ export interface Message {
   steps?: AgentStep[];
   currentStatus?: string;
   verification_score?: number;
+  evidence_score?: number;
   metadata?: {
     execution_time?: number;
     route_used?: string;
