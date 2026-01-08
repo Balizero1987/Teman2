@@ -21,14 +21,27 @@ if str(backend_path) not in sys.path:
     sys.path.insert(0, str(backend_path))
 
 from services.rag.agentic import create_agentic_rag
+from services.llm_clients.pricing import TokenUsage
 
 
-@pytest.fixture
-def mock_search_service():
-    """Mock SearchService"""
-    service = MagicMock()
-    service.search = AsyncMock(
-        return_value={
+@pytest.fixture(autouse=True)
+def mock_trace_span():
+    """Disable tracing for tests"""
+    from contextlib import contextmanager
+    
+    @contextmanager
+    def noop_trace_span(*args, **kwargs):
+        yield MagicMock()
+        
+    with patch("services.rag.agentic.orchestrator.trace_span", side_effect=noop_trace_span), \
+         patch("services.rag.agentic.reasoning.trace_span", side_effect=noop_trace_span), \
+         patch("app.utils.tracing.trace_span", side_effect=noop_trace_span):
+        yield
+
+
+class MockSearchService:
+    def __init__(self):
+        self.search = AsyncMock(return_value={
             "results": [
                 {
                     "id": "doc1",
@@ -38,37 +51,56 @@ def mock_search_service():
                 }
             ],
             "total": 1,
-        }
-    )
-    return service
+        })
 
+@pytest.fixture
+def mock_search_service():
+    """Mock SearchService"""
+    return MockSearchService()
+
+
+class MockPool:
+    def __init__(self, conn):
+        self.conn = conn
+    
+    def acquire(self):
+        return self._Context(self.conn)
+        
+    class _Context:
+        def __init__(self, conn):
+            self.conn = conn
+        async def __aenter__(self):
+            return self.conn
+        async def __aexit__(self, *args):
+            pass
 
 @pytest.fixture
 def mock_db_pool():
     """Mock PostgreSQL connection pool"""
-    pool = AsyncMock()
     conn = AsyncMock()
-
-    async def acquire():
-        return conn
-
-    pool.acquire = acquire
-    return pool
+    conn.fetchrow.return_value = None
+    return MockPool(conn)
 
 
 @pytest.fixture
 def mock_memory_orchestrator(mock_db_pool):
     """Mock Memory Orchestrator"""
     orchestrator = MagicMock()
-    orchestrator.get_user_context = AsyncMock(
-        return_value={
-            "profile": {"name": "Marco Verdi", "role": "Entrepreneur"},
-            "facts": ["Interested in E33G KITAS", "Budget: $50k USD"],
-            "collective_facts": [],
-            "entities": {"name": "Marco Verdi", "city": "Milano"},
-        }
-    )
+    
+    mock_context = MagicMock()
+    mock_context.profile = {"name": "Marco Verdi", "role": "Entrepreneur"}
+    mock_context.profile_facts = ["Interested in E33G KITAS", "Budget: $50k USD"]
+    mock_context.collective_facts = []
+    mock_context.entities = {"name": "Marco Verdi", "city": "Milano"}
+    mock_context.history = []
+    mock_context.timeline_summary = ""
+    mock_context.kg_entities = []
+    mock_context.summary = "Summary"
+    mock_context.counters = {}
+    
+    orchestrator.get_user_context = AsyncMock(return_value=mock_context)
     orchestrator.save_conversation = AsyncMock(return_value={"success": True})
+    orchestrator.initialize = AsyncMock(return_value=True)
     return orchestrator
 
 
@@ -100,22 +132,53 @@ class TestRAGMemoryKGIntegration:
         user_id = "marco@example.com"
 
         # Create orchestrator with memory
-        with patch("services.memory.MemoryOrchestrator", return_value=mock_memory_orchestrator):
-            orchestrator = create_agentic_rag(retriever=mock_search_service, db_pool=mock_db_pool)
+        orchestrator = create_agentic_rag(retriever=mock_search_service, db_pool=mock_db_pool)
+        # Inject mock memory orchestrator manually to bypass lazy loading
+        orchestrator._memory_orchestrator = mock_memory_orchestrator
+        
+        # Inject Mock LLM Gateway
+        mock_gateway = MagicMock()
+        mock_gateway.create_chat_with_history = MagicMock()
+        
+        # Build tool call candidate
+        candidate = MagicMock()
+        part = MagicMock()
+        part.function_call.name = "vector_search"
+        part.function_call.args = {"query": "E33G price", "collection": "visa_oracle"}
+        candidate.content.parts = [part]
+        response_tool = MagicMock(candidates=[candidate])
+        
+        # Build final answer candidate
+        candidate_final = MagicMock()
+        part_final = MagicMock()
+        part_final.text = "Final Answer: E33G costs $1000"
+        part_final.function_call = None
+        candidate_final.content.parts = [part_final]
+        response_final = MagicMock(candidates=[candidate_final])
+        
+        async def async_return(val): return val
+        
+        mock_gateway.send_message = MagicMock(
+            side_effect=[
+                async_return(("Thinking...", "mock", response_tool, TokenUsage())),
+                async_return(("Final Answer: Done", "mock", response_final, TokenUsage()))
+            ]
+        )
+        orchestrator.llm_gateway = mock_gateway
 
-            # Execute query
-            result = await orchestrator.process_query(
-                query=query, user_id=user_id, session_id="test-session", conversation_history=[]
-            )
+        # Execute query
+        result = await orchestrator.process_query(
+            query=query, user_id=user_id, session_id="test-session", conversation_history=[]
+        )
 
-            # Verify memory context was used
-            mock_memory_orchestrator.get_user_context.assert_called_once()
+        # Verify memory context was used
+        mock_memory_orchestrator.get_user_context.assert_called_once()
 
-            # Verify RAG search was executed
-            mock_search_service.search.assert_called()
+        # Verify RAG search was executed
+        mock_search_service.search.assert_called()
 
-            # Verify result includes personalized context
-            assert result is not None
+        # Verify result includes personalized context
+        assert result is not None
 
     @pytest.mark.asyncio
     async def test_conversation_to_kg_extraction(self, mock_db_pool, mock_search_service):
@@ -211,19 +274,39 @@ class TestRAGMemoryKGIntegration:
         )
 
         # Create orchestrator
-        with patch("services.memory.MemoryOrchestrator", return_value=mock_memory_orchestrator):
-            orchestrator = create_agentic_rag(retriever=mock_search_service, db_pool=mock_db_pool)
+        orchestrator = create_agentic_rag(retriever=mock_search_service, db_pool=mock_db_pool)
+        orchestrator._memory_orchestrator = mock_memory_orchestrator
+        
+        # Inject Mock LLM Gateway
+        mock_gateway = MagicMock()
+        mock_gateway.create_chat_with_history = MagicMock()
+        
+        # Simple final answer response (no tools needed for this test as we test context injection)
+        # Wait, if we want to verify context influence, we just need to ensure no error and context call
+        candidate_final = MagicMock()
+        part_final = MagicMock()
+        part_final.text = "Final Answer: Based on your budget of $50k..."
+        part_final.function_call = None
+        candidate_final.content.parts = [part_final]
+        response_final = MagicMock(candidates=[candidate_final])
+        
+        async def async_return(val): return val
+        
+        mock_gateway.send_message = MagicMock(
+            return_value=async_return(("Final Answer: Done", "mock", response_final, TokenUsage()))
+        )
+        orchestrator.llm_gateway = mock_gateway
 
-            # Execute query
-            result = await orchestrator.process_query(
-                query=query, user_id=user_id, session_id="test-session", conversation_history=[]
-            )
+        # Execute query
+        result = await orchestrator.process_query(
+            query=query, user_id=user_id, session_id="test-session", conversation_history=[]
+        )
 
-            # Verify memory facts were retrieved
-            mock_memory_orchestrator.get_user_context.assert_called_once()
+        # Verify memory facts were retrieved
+        mock_memory_orchestrator.get_user_context.assert_called_once()
 
-            # Verify response considers memory context
-            assert result is not None
+        # Verify response considers memory context
+        assert result is not None
 
     @pytest.mark.asyncio
     async def test_kg_entities_enhance_rag_search(self, mock_search_service, mock_db_pool):

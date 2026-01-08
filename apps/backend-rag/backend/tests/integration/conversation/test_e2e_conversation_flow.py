@@ -29,15 +29,27 @@ from services.misc.conversation_service import ConversationService
 @pytest.fixture
 def mock_db_pool():
     """Mock PostgreSQL connection pool"""
-    pool = AsyncMock()
+    pool = MagicMock()
     conn = AsyncMock()
+    # Attach conn to pool so tests can access and configure it
+    pool._conn = conn
+    
+    # Configure fetchrow defaults
+    conn.fetchrow.return_value = MagicMock()
+    
+    # Configure transaction context manager
+    transaction_ctx = AsyncMock()
+    transaction_ctx.__aenter__ = AsyncMock()
+    transaction_ctx.__aexit__ = AsyncMock()
+    conn.transaction.return_value = transaction_ctx
+    
+    class AsyncContextManager:
+        async def __aenter__(self):
+            return conn
+        async def __aexit__(self, exc_type, exc, tb):
+            pass
 
-    # Mock connection context manager
-    @pytest.fixture
-    async def acquire():
-        return conn
-
-    pool.acquire = acquire
+    pool.acquire.return_value = AsyncContextManager()
     return pool
 
 
@@ -73,7 +85,7 @@ def conversation_service(mock_db_pool, mock_memory_cache):
         "services.misc.conversation_service.get_memory_cache", return_value=mock_memory_cache
     ):
         service = ConversationService(db_pool=mock_db_pool)
-        return service
+        yield service
 
 
 class TestE2EConversationFlow:
@@ -98,7 +110,7 @@ class TestE2EConversationFlow:
         async def mock_fetchrow(*args, **kwargs):
             return mock_row
 
-        conn = await mock_db_pool.acquire()
+        conn = mock_db_pool._conn
         conn.fetchrow = AsyncMock(return_value=mock_row)
 
         # Mock Auto-CRM
@@ -139,7 +151,7 @@ class TestE2EConversationFlow:
             ]
         }[key]
 
-        conn = await mock_db_pool.acquire()
+        conn = mock_db_pool._conn
         conn.fetchrow = AsyncMock(return_value=mock_row)
 
         # Retrieve history
@@ -162,7 +174,7 @@ class TestE2EConversationFlow:
         session_id = "test-session-123"
 
         # Mock DB error
-        conn = await mock_db_pool.acquire()
+        conn = mock_db_pool._conn
         conn.fetchrow = AsyncMock(side_effect=Exception("DB error"))
 
         # Mock memory cache fallback
@@ -209,7 +221,7 @@ class TestE2EConversationFlow:
         mock_row2 = MagicMock()
         mock_row2.__getitem__ = lambda self, key: {"id": 2}[key]
 
-        conn = await mock_db_pool.acquire()
+        conn = mock_db_pool._conn
         conn.fetchrow = AsyncMock(side_effect=[mock_row1, mock_row2])
 
         # Save both turns
@@ -247,7 +259,7 @@ class TestE2EConversationFlow:
         mock_row = MagicMock()
         mock_row.__getitem__ = lambda self, key: {"id": 999}[key]
 
-        conn = await mock_db_pool.acquire()
+        conn = mock_db_pool._conn
         conn.fetchrow = AsyncMock(return_value=mock_row)
 
         # Mock EpisodicMemoryService
@@ -287,7 +299,7 @@ class TestE2EConversationFlow:
         mock_row = MagicMock()
         mock_row.__getitem__ = lambda self, key: {"id": 555}[key]
 
-        conn = await mock_db_pool.acquire()
+        conn = mock_db_pool._conn
         conn.fetchrow = AsyncMock(return_value=mock_row)
 
         # Save with metadata
@@ -311,7 +323,7 @@ class TestE2EConversationFlow:
         messages = [{"role": "user", "content": "Test"}]
 
         # Mock DB error
-        conn = await mock_db_pool.acquire()
+        conn = mock_db_pool._conn
         conn.fetchrow = AsyncMock(side_effect=Exception("DB connection failed"))
 
         # Save conversation - should fallback to memory cache
