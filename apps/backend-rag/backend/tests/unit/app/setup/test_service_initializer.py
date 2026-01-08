@@ -315,13 +315,20 @@ class TestInitializeDatabaseServices:
         mock_settings.db_pool_max_size = 20
         mock_settings.db_command_timeout = 60
 
-        mock_pool = AsyncMock()
+        mock_asyncpg.PostgresError = Exception
+
         mock_conn = AsyncMock()
-        mock_conn.__aenter__ = AsyncMock(return_value=mock_conn)
-        mock_conn.__aexit__ = AsyncMock(return_value=None)
         mock_conn.fetchval = AsyncMock(return_value=1)
         mock_conn.execute = AsyncMock()
-        mock_pool.acquire = AsyncMock(return_value=mock_conn)
+
+        class AsyncContextManager:
+            async def __aenter__(self):
+                return mock_conn
+            async def __aexit__(self, exc_type, exc, tb):
+                pass
+
+        mock_pool = MagicMock()
+        mock_pool.acquire.return_value = AsyncContextManager()
         mock_asyncpg.create_pool = AsyncMock(return_value=mock_pool)
 
         mock_ts_service = MagicMock()
@@ -348,6 +355,7 @@ class TestInitializeDatabaseServices:
         app.state = MagicMock()
 
         mock_settings.database_url = "postgresql://test:test@localhost/test"
+        mock_asyncpg.PostgresError = Exception
         mock_asyncpg.create_pool = AsyncMock(side_effect=ConnectionError("Connection failed"))
 
         result = await initialize_database_services(app)

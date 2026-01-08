@@ -675,6 +675,21 @@ class MetricsCollector:
         """
         cache_db_consistency_errors_total.labels(session_id=session_id).inc()
 
+    def stream_event_none(self):
+        stream_event_none_total.inc()
+
+    def stream_event_invalid_type(self):
+        stream_event_invalid_type_total.inc()
+
+    def stream_event_validation_failed(self):
+        stream_event_validation_failed_total.inc()
+
+    def stream_event_processing_error(self):
+        stream_event_processing_error_total.inc()
+
+    def stream_fatal_error(self):
+        stream_fatal_error_total.inc()
+
     # Google Drive Metrics Methods
     def record_drive_operation(
         self,

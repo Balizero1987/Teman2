@@ -6,6 +6,7 @@ import json
 import logging
 import shutil
 import time
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -37,20 +38,31 @@ if scraper_scripts_path.exists():
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-embedder = create_embeddings_generator()
+from functools import lru_cache
+
+@lru_cache()
+def get_embedder():
+    return create_embeddings_generator()
 
 # Staging Directories (mounted Fly volume)
-BASE_STAGING_DIR = Path("/data/staging")
+# Fallback to local directory if /data is not accessible (e.g. CI/CD)
+if Path("/data").exists() and os.access("/data", os.W_OK):
+    BASE_STAGING_DIR = Path("/data/staging")
+    PENDING_INTEL_PATH = Path("/tmp/pending_intel")
+else:
+    BASE_STAGING_DIR = Path("./data/staging")
+    PENDING_INTEL_PATH = Path("./data/pending_intel")
+
 VISA_STAGING_DIR = BASE_STAGING_DIR / "visa"
 NEWS_STAGING_DIR = BASE_STAGING_DIR / "news"
 
 # Ensure directories exist
-VISA_STAGING_DIR.mkdir(parents=True, exist_ok=True)
-NEWS_STAGING_DIR.mkdir(parents=True, exist_ok=True)
-
-# Voting storage for Telegram approval
-PENDING_INTEL_PATH = Path("/tmp/pending_intel")
-PENDING_INTEL_PATH.mkdir(exist_ok=True)
+try:
+    VISA_STAGING_DIR.mkdir(parents=True, exist_ok=True)
+    NEWS_STAGING_DIR.mkdir(parents=True, exist_ok=True)
+    PENDING_INTEL_PATH.mkdir(parents=True, exist_ok=True)
+except Exception as e:
+    logger.warning(f"Failed to create staging directories: {e}")
 
 # Qdrant collections for intel
 INTEL_COLLECTIONS = {
@@ -892,6 +904,7 @@ async def search_intel(request: IntelSearchRequest):
     """Search intel news with semantic search"""
     try:
         # Generate query embedding
+        embedder = get_embedder()
         query_embedding = embedder.generate_single_embedding(request.query)
 
         # Determine collections to search
