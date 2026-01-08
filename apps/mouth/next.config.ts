@@ -1,5 +1,11 @@
 import type { NextConfig } from 'next';
 import { withSentryConfig } from '@sentry/nextjs';
+import withBundleAnalyzer from '@next/bundle-analyzer';
+
+const bundleAnalyzer = withBundleAnalyzer({
+  enabled: process.env.ANALYZE === 'true',
+  openAnalyzer: false,
+});
 
 const nextConfig: NextConfig = {
   output: 'standalone',
@@ -45,6 +51,8 @@ const sentryWebpackPluginOptions = {
 };
 
 // Export with Sentry wrapper (only if Sentry is configured)
-export default process.env.SENTRY_DSN || process.env.NEXT_PUBLIC_SENTRY_DSN
+const configWithSentry = process.env.SENTRY_DSN || process.env.NEXT_PUBLIC_SENTRY_DSN
   ? withSentryConfig(nextConfig, sentryWebpackPluginOptions)
   : nextConfig;
+
+export default bundleAnalyzer(configWithSentry);
